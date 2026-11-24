@@ -1,8 +1,10 @@
 # image-compress
 
-把批量图片压缩到指定体积上限（默认 1MB）以内的命令行工具，也可作为智能体技能使用。
+把批量图片压缩到用户指定的体积上限以内的命令行工具，也可作为智能体技能使用。
 
 面向需要「图片必须小于某个体积」的场景：表单上传限制、IM 传递、档案归档、素材整理。
+
+体积上限通过 `--limit-mb` 指定，**没有默认值**——压到多少取决于具体场景的余量要求，由使用者决定。
 
 ## 特点
 
@@ -41,13 +43,13 @@ pip install pillow numpy zxing-cpp imagecodecs
 
 ```bash
 # 预演，不写盘
-python scripts/img_shrink.py --dry-run "/path/to/photos"
+python scripts/img_shrink.py --limit-mb 1 --dry-run "/path/to/photos"
 
 # 正式执行，原地覆盖
-python scripts/img_shrink.py "/path/to/photos"
+python scripts/img_shrink.py --limit-mb 1 "/path/to/photos"
 
 # 多个目录一次处理
-python scripts/img_shrink.py "/path/batch-a" "/path/batch-b"
+python scripts/img_shrink.py --limit-mb 1 "/path/batch-a" "/path/batch-b"
 
 # 指定体积上限
 python scripts/img_shrink.py --limit-mb 0.5 "/path/photos"
@@ -62,7 +64,7 @@ python scripts/img_shrink.py --limit-mb 0.5 --max-edge 2400 "/path/photos"
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--limit-mb` | 1.0 | 体积上限（MB，按 1024×1024 字节计） |
+| `--limit-mb` | **必填** | 体积上限（MB，按 1024×1024 字节计），无默认值 |
 | `--max-edge` | 0 | 长边硬上限，0=跟随原图。确有平台限制再传 |
 | `--min-edge` | 1500 | 最小长边，撑不住就报「无可行组合」 |
 | `--qr-min-edge` | 1800 | 含二维码图的最小长边，保扫码可用 |

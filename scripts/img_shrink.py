@@ -1,6 +1,6 @@
 """批量把图片压到指定体积上限内（原地覆盖，不留备份）。
 
-用途：需要「网页/IM 可用」的图片批量压到 1MB 以内。
+用途：电商面料图等需要「网页/IM 可用」的图片批量压到 1MB 以内。
 跑法：
   先看会做什么（不写盘）：
     python img_shrink.py --dry-run "D:/路径/批次目录"
@@ -10,7 +10,7 @@
     python img_shrink.py --no-qr "D:/路径/批次目录"
 
 参数：
-  --limit-mb 1.0     体积上限（默认 1.0）
+  --limit-mb 1.0     体积上限（必填，无默认值）
   --max-edge 0       长边硬上限（默认 0=跟随原图）
   --min-edge 1500    最小长边（默认 1500）
   --qr-min-edge 1800 含二维码图的最小长边（默认 1800，保扫码可用）
@@ -76,7 +76,7 @@ REGIONS = (
 def codes_full(img):
     """完整检测：多二值化器 + 精确位置裁切放大 + 区域盲扫兜底。
 
-    只收二维码（QRCode），避免页面上的数字文字被误识别成 Code128 等条码，
+    只收二维码（QRCode），避免页面上的货号/编号被误识别成 Code128 等条码，
     污染基准导致「压后多出一个码」的假告警。
     小尺寸的码（占全图不到 1%）在整图检测下常被 downscale 吃掉，
     故先用 read_barcodes 拿到位置信息，按位置裁切放大后重测。
@@ -135,7 +135,7 @@ def codes_full(img):
 
 
 def codes_quick(img):
-    """选参时的快速过滤：只认二维码，避免把数字文字当成码。"""
+    """选参时的快速过滤：只认二维码，避免把货号文字当成码。"""
     return {r.text for r in zxingcpp.read_barcodes(
         img, try_rotate=True, try_downscale=True)
         if r.format == zxingcpp.BarcodeFormat.QRCode}
@@ -212,8 +212,8 @@ W_SSIM, W_CHROMA = 0.65, 0.35
 # 低于此值的候选直接否决，比调权重更直接（分块复用同一张 map，开销约 4ms）。
 WORST_BLOCK_MIN = 0.75
 # 色度相对损失安全线：4:2:0 相比同尺寸 4:4:4 的色度 PSNR 降幅。
-# 用相对值而非绝对值：源图本身色度信息弱时（如高饱和大色块）4:4:4 也达不到高 dB，
-# 绝对阈值会误判。实测纹理图/文字图 4:2:0 仅掉 0.8-2.0dB（可接受），
+# 用相对值而非绝对值：源图本身色度信息弱时（如高饱和色卡）4:4:4 也达不到高 dB，
+# 绝对阈值会误判。实测面料/文字 4:2:0 仅掉 0.8-2.0dB（可接受），
 # 彩色页掉 6.8-15.5dB（须退回 4:4:4）。
 CHROMA_REL_DROP_DB = 3.0
 # 色度梯度预判：高于此值说明图里有细彩色边缘，直接跳过 4:2:0 试探省时间
@@ -221,7 +221,7 @@ CHROMA_EDGE_HINT = 4.0
 # 色度归一化上限：达到此 PSNR 视为色度无感（满分）
 CHROMA_NORM_DB = 50.0
 # 质量下限惩罚起点：低于此 quality 的候选按比例折损分数。
-# 实测真实语料上不加此约束会选出「3600px + q13」这种块效应明显的结果。
+# 实测真实面料图上不加此约束会选出「3600px + q13」这种块效应明显的结果。
 Q_PENALTY_FROM = 40
 # 质量验收线：达到此 quality 就不再为画质微差牺牲尺寸
 Q_ACCEPT = 75
@@ -284,7 +284,7 @@ def chroma_psnr(ref, dec):
 def chroma_edge_strength(img):
     """色度梯度均值，用于预判 4:2:0 是否可能糊掉彩色细节。
 
-    实测：彩色文字页 6.5、纹理图 1.2、文字页 1.1，相差 5 倍以上。
+    实测：彩色文字页 6.5、面料图 1.2、文字页 1.1，相差 5 倍以上。
     """
     w = min(800, max(img.size))
     r = w / max(img.size)
@@ -331,11 +331,11 @@ def encode(img, exif_bytes, dpi, quality, codec="pillow", subsampling=0):
     codec="mozjpeg"：mozjpeg 4.x，trellis 量化开启，渐进式。需 imagecodecs。
     codec="jpegli"：jpegli，自适应量化。需 imagecodecs。
 
-    2026-11-24 用 33 张同批语料（2400px、600KB 预算）实测：
+    2026-11-24 用 33 张真实面料图（2400px、600KB 预算）实测：
         mozjpeg 平均 SSIM 0.95814 / 强边保持 0.8395
         pillow  平均 SSIM 0.95730 / 强边保持 0.8720
         jpegli  平均 SSIM 0.95337 / 强边保持 0.8577
-    在合成图上面 jpegli 领先，但在该批真实语料上并非如此——其纹理有大量
+    在合成图上面 jpegli 领先，但在真实面料图上并非如此——面料纹理有大量
     自相似高频，jpegli 的自适应量化会把它们当噪声抹掉。故 auto 模式全试，
     由融合指标（强边保持权重最高）决定，不预设赢家。
 
@@ -673,7 +673,9 @@ def collect_jobs(dirs, opts):
 def main():
     ap = argparse.ArgumentParser(description="批量把图片压到指定体积上限内（原地覆盖）")
     ap.add_argument("dirs", nargs="+", help="图片目录（可多个）")
-    ap.add_argument("--limit-mb", type=float, default=1.0)
+    ap.add_argument("--limit-mb", type=float, required=True,
+                    help="体积上限（MB，必填）。压缩到多少由使用者按目标场景决定，"
+                         "没有通用默认值——上传限制、IM 传输、归档各自的余量不同。")
     ap.add_argument("--max-edge", type=int, default=0,
                     help="长边硬上限，0=不限制（默认跟随原图）。"
                          "实测把大图硬砍到 3000 反而浪费预算：原尺寸能塞进上限时"
