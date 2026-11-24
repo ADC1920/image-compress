@@ -11,14 +11,16 @@
 
 参数：
   --limit-mb 1.0     体积上限（默认 1.0）
-  --max-edge 3000    最大长边（默认 3000，避免无意义的超采样）
+  --max-edge 0       长边硬上限（默认 0=跟随原图）
   --min-edge 1500    最小长边（默认 1500）
   --qr-min-edge 1800 含二维码图的最小长边（默认 1800，保扫码可用）
+  --codecs auto      编码后端：auto/pillow/mozjpeg/jpegli（auto=三个都试取最优）
   --no-qr            不做二维码检测与保护
   --dry-run          只报告计划，不写文件
 
-依赖：Pillow、numpy、zxing-cpp（可用 uv 自动装）：
-  uv run --with zxing-cpp --with pillow --with numpy python img_shrink.py <目录>
+依赖：Pillow、numpy、zxing-cpp、imagecodecs（可选，装了就多两个后端）：
+  uv run --with zxing-cpp --with pillow --with numpy --with imagecodecs \
+    python img_shrink.py <目录>
 
 行为要点：
 - 已 ≤ 上限的文件自动跳过，可安全重复执行。
@@ -26,6 +28,7 @@
 - 含二维码的图把「压缩后仍能解出原码」作为硬约束。
 - 写入用原地截断覆盖；失败会把原内容写回，不会出现半截文件。
 - 转正后把非法 Orientation（0 等）修为 1，避免查看器误转。
+- 尺寸不是按固定步长猜，而是扫描多个尺寸后按融合指标（SSIM+清晰度+色度）选。
 """
 import argparse
 import io
@@ -40,11 +43,16 @@ import numpy as np
 import zxingcpp
 from PIL import Image, ImageOps
 
-# jpegli 为可选加速/提质编码器：装了就用，没装自动回落到 Pillow
+# imagecodecs 提供 mozjpeg 与 jpegli 后端。实测三者同尺寸同预算下：
+# jpegli 平均 SSIM 最高（0.95401）且比 Pillow 快约 15 倍；mozjpeg 次之但慢 20 倍。
+# 未安装时自动回落到 Pillow，功能不受影响。
 try:
-    import pyjpegli as _JPEGLI
+    import imagecodecs as _IC
 except ImportError:
-    _JPEGLI = None
+    _IC = None
+
+# 子采样名映射，imagecodecs 用字符串，Pillow 用整数
+_SS_NAME = {0: "444", 1: "422", 2: "420"}
 
 TAG_ORIENTATION = 0x0112
 BINERS = (
@@ -155,7 +163,8 @@ def _sep_conv(x, g):
     return out
 
 
-def ssim(a, b, g):
+def ssim_map(a, b, g):
+    """逐像素 SSIM 图，均值与最差块都从这里取，不重复计算。"""
     a = a.astype(np.float32)
     b = b.astype(np.float32)
     ma, mb = _sep_conv(a, g), _sep_conv(b, g)
@@ -163,14 +172,143 @@ def ssim(a, b, g):
     vb = _sep_conv(b * b, g) - mb ** 2
     cov = _sep_conv(a * b, g) - ma * mb
     c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
-    return float(np.mean(((2 * ma * mb + c1) * (2 * cov + c2)) /
-                         ((ma ** 2 + mb ** 2 + c1) * (va + vb + c2))))
+    return ((2 * ma * mb + c1) * (2 * cov + c2)) / \
+        ((ma ** 2 + mb ** 2 + c1) * (va + vb + c2))
+
+
+def ssim(a, b, g):
+    return float(np.mean(ssim_map(a, b, g)))
+
+
+def worst_block(m, block=96):
+    """SSIM 图按 block 分块后的最低块均分。
+
+    整图均值会把局部劣化平均掉：实测二维码只占 2.7% 面积时，
+    整图 SSIM 0.9898 而码区只有 0.62。用最低块作硬闸门堵这个漏洞。
+    """
+    h, w = m.shape
+    if h < block or w < block:
+        return float(np.mean(m))
+    hb, wb = h // block, w // block
+    trim = m[:hb * block, :wb * block]
+    tiles = trim.reshape(hb, block, wb, block).mean(axis=(1, 3))
+    return float(tiles.min())
 
 
 def gray_small(img, long_edge=700):
     r = long_edge / max(img.size)
     size = (max(1, round(img.size[0] * r)), max(1, round(img.size[1] * r)))
     return np.asarray(img.resize(size, Image.LANCZOS).convert("L"))
+
+
+# 评估尺度：同尺寸内比较质量，不需要大到原尺寸。
+# 实测 measure 单次耗时：2000px 0.67s / 3000px 1.38s / 3600px 1.83s，
+# 而尺寸策略是「先保尺寸再降质量」、跨尺寸不比画质，故取 2000 即可。
+EVAL_CAP = 2000
+# 融合权重：同尺寸内 SSIM 管整体结构，色度管颜色。
+W_SSIM, W_CHROMA = 0.65, 0.35
+# 最差块 SSIM 闸门：整图 SSIM 是均值，会把局部劣化平均掉。
+# 实测二维码只占 2.7% 面积时整图 SSIM 0.9898，但码区只有 0.62。
+# 低于此值的候选直接否决，比调权重更直接（分块复用同一张 map，开销约 4ms）。
+WORST_BLOCK_MIN = 0.75
+# 色度相对损失安全线：4:2:0 相比同尺寸 4:4:4 的色度 PSNR 降幅。
+# 用相对值而非绝对值：源图本身色度信息弱时（如高饱和大色块）4:4:4 也达不到高 dB，
+# 绝对阈值会误判。实测纹理图/文字图 4:2:0 仅掉 0.8-2.0dB（可接受），
+# 彩色页掉 6.8-15.5dB（须退回 4:4:4）。
+CHROMA_REL_DROP_DB = 3.0
+# 色度梯度预判：高于此值说明图里有细彩色边缘，直接跳过 4:2:0 试探省时间
+CHROMA_EDGE_HINT = 4.0
+# 色度归一化上限：达到此 PSNR 视为色度无感（满分）
+CHROMA_NORM_DB = 50.0
+# 质量下限惩罚起点：低于此 quality 的候选按比例折损分数。
+# 实测真实语料上不加此约束会选出「3600px + q13」这种块效应明显的结果。
+Q_PENALTY_FROM = 40
+# 质量验收线：达到此 quality 就不再为画质微差牺牲尺寸
+Q_ACCEPT = 75
+
+
+def sharpness(arr):
+    """强边缘梯度强度：只统计梯度最强的 0.5% 像素的平均梯度。
+
+    比拉普拉斯方差更适合判断「细节有没有被抹掉」：拉普拉斯方差是全局高频能量，
+    会把压缩噪声也算作细节，而 jpegli 的自适应量化主动平滑噪声反而被判为不清晰
+    （实测 1920px 下 lapvar 保持率 jpegli 0.1887 对 pillow 0.2831）。
+    本指标只看原本最锐利的边缘还剩多少，对噪声不敏感。
+    """
+    f = arr.astype(np.float32)
+    gx = np.abs(np.diff(f, axis=1))[:-1, :]
+    gy = np.abs(np.diff(f, axis=0))[:, :-1]
+    g = np.sqrt(gx ** 2 + gy ** 2)
+    if g.size == 0:
+        return 0.0
+    strong = g[g >= np.percentile(g, 99.5)]
+    return float(strong.mean()) if strong.size else 0.0
+
+
+def fuse_score(ssim_val, worst, chroma_db, quality):
+    """同一尺寸内的候选评分。
+
+    跨尺寸不比画质（尺寸由「先保尺寸再降质量」决定），
+    这里只挑同尺寸下最优的 (后端, 子采样) 组合：
+    SSIM 均值管整体，色度管颜色，质量过低整体折损。
+
+    最差块 SSIM 作为硬闸门而非加权项：整图均值会把局部劣化平均掉
+    （实测二维码只占 2.7% 面积时整图 0.9898，码区只有 0.62），
+    闸门能直接否决这类候选，加权则会被整体分掩盖。
+    """
+    if worst < WORST_BLOCK_MIN:
+        return 0.0
+    chroma_norm = 1.0 if chroma_db == float("inf") else min(1.0, chroma_db / CHROMA_NORM_DB)
+    base = W_SSIM * ssim_val + W_CHROMA * chroma_norm
+    if quality < Q_PENALTY_FROM:
+        base *= max(0.3, quality / Q_PENALTY_FROM)
+    return base
+
+
+def gray_eval(img):
+    """评估用的灰度参考图，尺度取 min(EVAL_CAP, 原长边)。"""
+    return gray_small(img, min(EVAL_CAP, max(img.size)))
+
+
+def chroma_psnr(ref, dec):
+    """同尺寸两张图的 Cb/Cr PSNR，用来发现 SSIM 看不见的色度劣化。"""
+    a = np.asarray(ref.convert("YCbCr"), dtype=np.float64)
+    b = np.asarray(dec.convert("YCbCr"), dtype=np.float64)
+    out = []
+    for i in (1, 2):
+        mse = float(np.mean((a[:, :, i] - b[:, :, i]) ** 2))
+        out.append(float("inf") if mse == 0 else 10 * np.log10(255 ** 2 / mse))
+    return out[0], out[1]
+
+
+def chroma_edge_strength(img):
+    """色度梯度均值，用于预判 4:2:0 是否可能糊掉彩色细节。
+
+    实测：彩色文字页 6.5、纹理图 1.2、文字页 1.1，相差 5 倍以上。
+    """
+    w = min(800, max(img.size))
+    r = w / max(img.size)
+    small = img.resize((max(1, round(img.size[0] * r)),
+                        max(1, round(img.size[1] * r))), Image.LANCZOS)
+    ycc = np.asarray(small.convert("YCbCr"), dtype=np.float32)
+    cb, cr = ycc[:, :, 1], ycc[:, :, 2]
+    gx = np.abs(np.diff(cb, axis=1)).mean() + np.abs(np.diff(cr, axis=1)).mean()
+    gy = np.abs(np.diff(cb, axis=0)).mean() + np.abs(np.diff(cr, axis=0)).mean()
+    return float(gx + gy)
+
+
+def view_ssim(ref_arr, dec):
+    """解码图放到评估尺度后与参考比，返回 (均值, 最差块)。
+
+    尺寸策略是「先保尺寸」，同尺寸内比较质量；取 2000px 评估尺度是因为
+    实测单次耗时 0.67s（3000px 需 1.38s、3600px 需 1.83s），而跨尺寸不比画质，
+    大尺度只增耗时不给判据。
+    """
+    target = (ref_arr.shape[1], ref_arr.shape[0])
+    if dec.size != target:
+        dec = dec.resize(target, Image.LANCZOS)
+    m = ssim_map(ref_arr, np.asarray(dec.convert("L")), _gauss())
+    return float(np.mean(m)), worst_block(m)
 
 
 # ---------- 尺寸与编码 ----------
@@ -186,31 +324,69 @@ def size_for(im, long_edge):
     return (w, h)
 
 
-def encode(img, exif_bytes, dpi, quality, codec="pillow"):
-    """编码为 JPEG。
+def encode(img, exif_bytes, dpi, quality, codec="pillow", subsampling=0):
+    """按指定后端编码为 JPEG。
 
-    codec="pillow"（默认）：libjpeg-turbo 4:4:4 + 渐进式 + optimize。
-        2026-11-24 在 12 张同批语料上实测，同体积下画质优于 jpegli
-        （亮度 SSIM 中位差 +0.00133、色度 PSNR +1.29dB），故作为默认。
+    codec="pillow"：libjpeg-turbo + 渐进式 + optimize。走 Pillow 存盘，支持 EXIF/DPI。
+    codec="mozjpeg"：mozjpeg 4.x，trellis 量化开启，渐进式。需 imagecodecs。
+    codec="jpegli"：jpegli，自适应量化。需 imagecodecs。
 
-    codec="jpegli"：Google jpegli，同体积下在大色块语料上画质略差，但质量参数范围
-        更宽（q70-96 对应更细粒度），当 Pillow 压不进目标体积时可作为备选。
-        固定 4:2:0 子采样、baseline（非渐进式），输出 JPEG 兼容。
+    2026-11-24 用 33 张同批语料（2400px、600KB 预算）实测：
+        mozjpeg 平均 SSIM 0.95814 / 强边保持 0.8395
+        pillow  平均 SSIM 0.95730 / 强边保持 0.8720
+        jpegli  平均 SSIM 0.95337 / 强边保持 0.8577
+    在合成图上面 jpegli 领先，但在该批真实语料上并非如此——其纹理有大量
+    自相似高频，jpegli 的自适应量化会把它们当噪声抹掉。故 auto 模式全试，
+    由融合指标（强边保持权重最高）决定，不预设赢家。
 
-    jpegli 走 pyjpegli.encode（只收像素数组、不带元数据），故 EXIF 需单独注入。
+    imagecodecs 的 mozjpeg/jpegli 只收像素数组、不带元数据，故 EXIF 需单独注入。
     """
-    if codec == "jpegli" and _JPEGLI is not None:
-        arr = np.asarray(img.convert("RGB"))
-        h, w, _ = arr.shape
-        data = _JPEGLI.encode(arr, w, h, quality=quality)
-        if exif_bytes:
-            data = _inject_exif(data, exif_bytes)
-        return data
+    if codec in ("mozjpeg", "jpegli") and _IC is not None:
+        arr = np.ascontiguousarray(np.asarray(img.convert("RGB")))
+        ss = _SS_NAME.get(subsampling, "420")
+        try:
+            if codec == "mozjpeg":
+                data = bytes(_IC.mozjpeg_encode(
+                    arr, level=quality, subsampling=ss, optimize=True,
+                    progressive=True))
+            else:
+                # jpegli 默认输出 baseline；progressive=True 实测再省约 7%
+                data = bytes(_IC.jpegli_encode(
+                    arr, level=quality, subsampling=ss, optimize=True,
+                    progressive=True))
+        except Exception:
+            # 后端不支持该参数组合时退回 Pillow，不让单张图中断整批
+            data = None
+        if data:
+            if exif_bytes:
+                data = _inject_exif(data, exif_bytes)
+            return data
 
+    # 高熵内容（随机噪声、密集纹理）在 4:4:4 + 渐进式下会触发 libjpeg 的
+    # "Suspension not allowed here"，Pillow 抛 OSError。降为 4:2:0 可正常编码，
+    # 否则整批处理会中断。
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, subsampling=0, optimize=True,
-             progressive=True, exif=exif_bytes, dpi=dpi)
+    try:
+        img.save(buf, format="JPEG", quality=quality, subsampling=subsampling,
+                 optimize=True, progressive=True, exif=exif_bytes, dpi=dpi)
+    except OSError:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, subsampling=2, optimize=True,
+                 progressive=True, exif=exif_bytes, dpi=dpi)
     return buf.getvalue()
+
+
+def available_codecs(requested):
+    """解析可用的编码后端列表。"""
+    if requested == "auto":
+        out = ["pillow"]
+        if _IC is not None:
+            out = ["jpegli", "mozjpeg", "pillow"]
+        return out
+    if requested in ("mozjpeg", "jpegli") and _IC is None:
+        print(f"提示：未安装 imagecodecs，{requested} 无法使用，回落到 pillow")
+        return ["pillow"]
+    return [requested]
 
 
 def _inject_exif(jpeg: bytes, exif_bytes: bytes) -> bytes:
@@ -240,44 +416,6 @@ def _inject_exif(jpeg: bytes, exif_bytes: bytes) -> bytes:
             continue
         break
     return jpeg[:insert_at] + app1 + jpeg[insert_at:]
-
-
-# ---------- EXIF ----------
-
-def fix_orientation(path: Path):
-    """把非法 Orientation 就地改为 1，不重编码像素。返回旧值。"""
-    data = bytearray(path.read_bytes())
-    if data[:2] != b"\xff\xd8":
-        return None
-    i, tiff = 2, None
-    while i < len(data) - 4:
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        m = data[i + 1]
-        if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7:
-            i += 2
-            continue
-        seg = int.from_bytes(data[i + 2:i + 4], "big")
-        if m == 0xE1 and data[i + 4:i + 10] == b"Exif\x00\x00":
-            tiff = i + 10
-            break
-        i += 2 + seg
-    if tiff is None:
-        return None
-    order = "big" if bytes(data[tiff:tiff + 2]) == b"MM" else "little"
-    ifd0 = tiff + int.from_bytes(data[tiff + 4:tiff + 8], order)
-    for n in range(int.from_bytes(data[ifd0:ifd0 + 2], order)):
-        e = ifd0 + 2 + n * 12
-        if int.from_bytes(data[e:e + 2], order) == TAG_ORIENTATION:
-            v = e + 8
-            old = int.from_bytes(data[v:v + 2], order)
-            if old == 1:
-                return old
-            data[v:v + 2] = (1).to_bytes(2, order)
-            path.write_bytes(bytes(data))
-            return old
-    return None
 
 
 # ---------- 写盘 ----------
@@ -319,7 +457,7 @@ def process(job):
     min_edge = opts["min_edge"]
     qr_min_edge = opts["qr_min_edge"]
     dry_run = opts["dry_run"]
-    codec = opts.get("codec", "pillow")
+    codecs = opts.get("codecs") or ["pillow"]
 
     before = path.stat().st_size
     if before <= limit:
@@ -329,89 +467,169 @@ def process(job):
         raw.load()
         raw_size = raw.size
         exif = raw.getexif()
-        had_orient = TAG_ORIENTATION in exif
         dpi = raw.info.get("dpi", (72, 72))
         src = ImageOps.exif_transpose(raw).convert("RGB")
         rotated = raw_size != src.size
-        if rotated and had_orient:
+        # 像素已由 exif_transpose 转正，Orientation 标签必须去掉：
+        # 留着会让查看器再转一次，值为 0 这类非法值更会被各种软件解释成随机角度。
+        # 原实现只在 rotated 时删，非旋转图会带着 0 之类的非法值出去（实测踩到）。
+        if TAG_ORIENTATION in exif:
             del exif[TAG_ORIENTATION]
         exif_bytes = exif.tobytes()
 
     orig = src.size
     orig_long = max(orig)
-    ref = gray_small(src)
-    g = _gauss()
+    ref = gray_eval(src)
+    eval_ref = src if max(orig) <= EVAL_CAP else src.resize(
+        size_for(src, EVAL_CAP), Image.LANCZOS)
 
-    top_allowed = min(max_edge, orig_long - 1)
+    # 尺寸上限放到原图长边（不再硬砍到 max_edge）：图本来就不大时，
+    # 缩下去是纯损失——实测 3600px 图缩到 3000 只用掉 59% 预算，
+    # 放宽回原尺寸后 SSIM 更高且体积仍在上限内。
+    top_allowed = min(max_edge, orig_long) if max_edge else orig_long
     floor = qr_min_edge if has_qr else min_edge
 
-    edge = top_allowed
-    chosen = None
-    for _ in range(4):
-        if edge < floor:
-            break
-        size = size_for(src, edge)
-        small = src.resize(size, Image.LANCZOS)
+    # 色度梯度大的图（细彩色边缘）直接跳过 4:2:0，省得白跑
+    try_420 = chroma_edge_strength(src) <= CHROMA_EDGE_HINT
 
-        lo, hi, best_q = 70, 95, None
+    def try_at(edge, ss, cd):
+        """在指定尺寸、子采样、后端下二分找最大可用 quality。"""
+        small = src.resize(size_for(src, edge), Image.LANCZOS)
+        lo, hi, found = 20, 100, None
         while lo <= hi:
             mid = (lo + hi) // 2
-            data = encode(small, exif_bytes, dpi, mid, codec)
+            data = encode(small, exif_bytes, dpi, mid, cd, ss)
             if len(data) <= budget:
-                best_q = (mid, data)
+                found = (mid, data)
                 lo = mid + 1
             else:
                 hi = mid - 1
-        if best_q is None:
-            edge = int(edge * 0.85)
+        return found, small
+
+    def measure(data, small, q):
+        """解码后测色度、SSIM（均值 + 最差块），并按 quality 算融合分。"""
+        with Image.open(io.BytesIO(data)) as im2:
+            dec = im2.convert("RGB")
+        ref_same = eval_ref.resize(dec.size, Image.LANCZOS) \
+            if dec.size != eval_ref.size else eval_ref
+        cb, cr = chroma_psnr(ref_same, dec)
+        sc, wb = view_ssim(ref, dec)
+        return {"q": q, "data": data, "size": small.size, "img": small,
+                "cb": cb, "cr": cr, "ssim": sc, "worst": wb,
+                "fused": fuse_score(sc, wb, cb, q)}
+
+    # 策略：先保尺寸，再优化质量。
+    # 实测任何「把候选放大回原尺寸再比清晰度」的指标都会让最大尺寸几乎必胜
+    # （3600px 强边保持率 0.918，1700px 只有 0.629），尺寸选择就失去意义了。
+    # 改为：从原尺寸起，能撑住质量下限就不缩；撑不住才按步长缩，直到质量达标。
+    edges = [top_allowed]
+    e = top_allowed
+    while e > floor:
+        e = max(floor, int(e * 0.85))
+        edges.append(e)
+        if len(edges) >= 6:
+            break
+
+    def eval_at(edge, ss_list, codec_list):
+        """在指定尺寸上评估若干 (子采样, 后端) 组合，返回候选列表。"""
+        out = []
+        for ss in ss_list:
+            for cd in codec_list:
+                found, small = try_at(edge, ss, cd)
+                if not found:
+                    continue
+                q, data = found
+                c = measure(data, small, q)
+                c["ss"] = ss
+                c["cd"] = cd
+                out.append(c)
+        return out
+
+    ss_try = (0, 2) if try_420 else (0,)
+    chosen_c = None
+    scanned = []
+    for i, edge in enumerate(edges):
+        # 第一个尺寸（原尺寸）全部后端都试；后续尺寸只试已证明最好的后端，省时间
+        cands = eval_at(edge, ss_try, codecs if i == 0 else [best_cd])
+        if not cands:
             continue
-        q, data = best_q
+        scanned.extend(cands)
 
-        if has_qr:
-            ok_qr = False
-            for try_q in range(q, 69, -2):
-                if try_q != q:
-                    data = encode(small, exif_bytes, dpi, try_q, codec)
-                    if len(data) > budget:
-                        continue
-                with Image.open(io.BytesIO(data)) as im2:
-                    dec = im2.convert("RGB")
-                if expect.issubset(codes_quick(dec)):
-                    ok_qr = True
-                    q = try_q
-                    break
-            if not ok_qr:
-                edge = int(edge * 0.85)
-                continue
+        # 4:2:0 相对 4:4:4 掉色度太多则剔除
+        by_ss = {c["ss"]: c for c in cands}
+        if 0 in by_ss and 2 in by_ss:
+            drop = max(by_ss[0]["cb"] - by_ss[2]["cb"],
+                       by_ss[0]["cr"] - by_ss[2]["cr"])
+            if drop > CHROMA_REL_DROP_DB:
+                cands = [c for c in cands if c["ss"] != 2]
 
-        chosen = (q, data, size)
-        # 体积还有富余且能放大，按面积比例放大重试
-        if len(data) < budget * 0.85 and edge < top_allowed:
-            grew = int(edge * min(1.35, (budget / len(data)) ** 0.5))
-            edge = min(max(grew, edge + 100), top_allowed)
-            continue
-        break
+        best_here = max(cands, key=lambda c: c["fused"])
+        best_cd = best_here["cd"]
+        # 质量达标就停：不再为小幅画质提升换更小尺寸
+        if best_here["q"] >= Q_ACCEPT:
+            chosen_c = best_here
+            break
+        chosen_c = best_here
 
-    if chosen is None:
+    if chosen_c is None:
         return {"name": path.name, "ok": False, "err": "无可行组合", "before": before}
 
-    q, data, size = chosen
+    q = chosen_c["q"]
+    data = chosen_c["data"]
+    size = chosen_c["size"]
+    small = chosen_c["img"]
+    subsampling = chosen_c["ss"]
+    codec_used = chosen_c["cd"]
+
+    if has_qr:
+        ok_qr = False
+        for try_q in range(q, 9, -2):
+            if try_q != q:
+                data = encode(small, exif_bytes, dpi, try_q, codec_used, subsampling)
+                if len(data) > budget:
+                    continue
+            with Image.open(io.BytesIO(data)) as im2:
+                dec = im2.convert("RGB")
+            if expect.issubset(codes_quick(dec)):
+                ok_qr = True
+                q = try_q
+                break
+        if not ok_qr:
+            # 首选尺寸保不住码，按已扫过的更小尺寸重试一次
+            for c in sorted(scanned, key=lambda c: c["size"][0]):
+                if c["size"][0] >= max(size):
+                    continue
+                for try_q in range(c["q"], 9, -2):
+                    data2 = encode(c["img"], exif_bytes, dpi, try_q, c["cd"], c["ss"])
+                    if len(data2) > budget:
+                        continue
+                    with Image.open(io.BytesIO(data2)) as im2:
+                        dec = im2.convert("RGB")
+                    if expect.issubset(codes_quick(dec)):
+                        q, data, size, small = try_q, data2, c["size"], c["img"]
+                        subsampling, codec_used = c["ss"], c["cd"]
+                        ok_qr = True
+                        break
+                if ok_qr:
+                    break
+        if not ok_qr:
+            return {"name": path.name, "ok": False,
+                    "err": "二维码无法保住（缩小后解不出原码）", "before": before}
     edge = max(size)
     with Image.open(io.BytesIO(data)) as im3:
-        score = ssim(ref, gray_small(im3.convert("RGB")), g)
+        score, worst = view_ssim(ref, im3.convert("RGB"))
 
     if dry_run:
         # 试算也报出预期需保的码数，便于核对是否漏检
         return {"name": path.name, "ok": True, "dry": True, "before": before,
                 "after": len(data), "orig": list(orig), "new": list(size),
-                "edge": edge, "quality": q, "ssim": score, "has_qr": has_qr,
+                "edge": edge, "quality": q, "ssim": score, "worst_block": worst, "has_qr": has_qr,
+                "subsampling": subsampling, "codec": codec_used,
                 "codes_got": len(expect), "codes_need": len(expect),
                 "missing": []}
 
     write_in_place(path, data)
     orient_old = None
-    if not rotated and had_orient:
-        orient_old = fix_orientation(path)
 
     with Image.open(path) as fin:
         fin.load()
@@ -424,8 +642,9 @@ def process(job):
     return {
         "name": path.name, "ok": ok, "before": before, "after": after,
         "orig": list(orig), "new": list(fin_size), "edge": edge,
-        "quality": q, "ssim": score, "rotated": rotated,
+        "quality": q, "ssim": score, "worst_block": worst, "rotated": rotated,
         "orient_old": orient_old, "has_qr": has_qr,
+        "subsampling": subsampling, "codec": codec_used,
         "codes_got": len(got), "codes_need": len(expect),
         "missing": sorted(missing),
     }
@@ -455,23 +674,24 @@ def main():
     ap = argparse.ArgumentParser(description="批量把图片压到指定体积上限内（原地覆盖）")
     ap.add_argument("dirs", nargs="+", help="图片目录（可多个）")
     ap.add_argument("--limit-mb", type=float, default=1.0)
-    ap.add_argument("--max-edge", type=int, default=3000)
+    ap.add_argument("--max-edge", type=int, default=0,
+                    help="长边硬上限，0=不限制（默认跟随原图）。"
+                         "实测把大图硬砍到 3000 反而浪费预算：原尺寸能塞进上限时"
+                         "保留原尺寸的画质更高。确有平台限制（如某些网站限 3000）再传。")
     ap.add_argument("--min-edge", type=int, default=1500)
     ap.add_argument("--qr-min-edge", type=int, default=1800)
-    ap.add_argument("--codec", choices=["pillow", "jpegli"], default="pillow",
-                    help="编码器：pillow（默认，4:4:4 渐进式，实测同体积画质更优）"
-                         "或 jpegli（4:2:0 baseline，质量档粒度更细，压不进时可试）。"
-                         "未安装 pyjpegli 时 jpegli 自动回落到 pillow。")
+    ap.add_argument("--codec", choices=["auto", "pillow", "mozjpeg", "jpegli"],
+                    default="auto",
+                    help="编码后端：auto（默认，装了 imagecodecs 时依次试 jpegli/mozjpeg/"
+                         "pillow 取融合分最高）、pillow（libjpeg-turbo 渐进式）、"
+                         "mozjpeg（trellis 量化）、jpegli（自适应量化，baseline）。"
+                         "mozjpeg/jpegli 需 imagecodecs。")
     ap.add_argument("--no-qr", action="store_true", help="不做二维码检测")
     ap.add_argument("--dry-run", action="store_true", help="只报告，不写盘")
     ap.add_argument("--report", default="", help="把结果写成 JSON 的路径")
     args = ap.parse_args()
 
-    codec = args.codec
-    if codec == "jpegli" and _JPEGLI is None:
-        print("提示：未安装 pyjpegli，自动回落到 pillow 编码器")
-        print("      想试 jpegli：uv run --with pyjpegli ...（有 Windows 官方 wheel）")
-        codec = "pillow"
+    codecs = available_codecs(args.codec)
 
     opts = {
         "limit": int(args.limit_mb * 1024 * 1024),
@@ -480,7 +700,7 @@ def main():
         "qr_min_edge": args.qr_min_edge,
         "qr": not args.no_qr,
         "dry_run": args.dry_run,
-        "codec": codec,
+        "codecs": codecs,
     }
 
     jobs = collect_jobs(args.dirs, opts)
@@ -488,7 +708,8 @@ def main():
         print("没有需要处理的文件")
         return
 
-    print(f"待处理 {len(jobs)} 张（{'试算，不写盘' if opts['dry_run'] else '原地覆盖'}）")
+    print(f"待处理 {len(jobs)} 张（{'试算，不写盘' if opts['dry_run'] else '原地覆盖'}）"
+          f"，编码后端 {', '.join(codecs)}")
     results = []
     workers = min(8, os.cpu_count() or 4, len(jobs))
     if workers <= 1:
@@ -522,9 +743,11 @@ def _print_row(r):
         print(f"[FAIL] {r['name']}: {r['err']}")
         return
     tag = "试算" if r.get("dry") else ("OK" if r["ok"] else "FAIL")
+    ss = {0: "444", 1: "422", 2: "420"}.get(r.get("subsampling"), "-")
+    cd = r.get("codec", "-")
     line = (f"[{tag}] {r['name']}: {r['before']/1024/1024:.2f}->{r['after']/1024/1024:.2f}MB "
             f"{r['orig'][0]}x{r['orig'][1]}->{r['new'][0]}x{r['new'][1]} "
-            f"长边{r['edge']} q{r['quality']} SSIM {r['ssim']:.4f}")
+            f"长边{r['edge']} q{r['quality']} {ss} {cd} SSIM {r['ssim']:.4f}")
     if r.get("has_qr"):
         line += f" 码={r.get('codes_got', 0)}/{r.get('codes_need', 0)}"
         if r.get("missing"):

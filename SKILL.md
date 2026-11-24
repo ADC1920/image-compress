@@ -1,7 +1,7 @@
 ---
 name: image-compress
 license: MIT
-description: "批量把图片压缩到指定体积上限（默认 1MB）以内，原地覆盖不留备份。分辨率按长边统一规划，质量用二分搜索取达标最高档，含二维码的图自动做保码校验（压缩后仍能解出原码），转正后清理非法 Orientation。触发：压缩图片、图片太大、压到1MB、批量压图、图片瘦身、减小图片体积、图片压缩、compress images、reduce image size、image compression。English keywords: batch image compression, resize images under size limit, compress photos to 1MB, image optimizer, batch resize with quality search."
+description: "批量把图片压缩到指定体积上限（默认 1MB）以内，原地覆盖不留备份。先保尺寸再降质量（质量跌破 75 才缩一档），编码后端在 jpegli/mozjpeg/pillow 间自动选优，色度子采样按内容自适应，含二维码的图自动做保码校验（压缩后仍能解出原码），像素转正后清除 Orientation 标签。触发：压缩图片、图片太大、压到1MB、批量压图、图片瘦身、减小图片体积、图片压缩、jpg 太大、照片太大、compress images、reduce image size、image compression、image optimizer。English keywords: batch image compression, resize images under size limit, compress photos to 1MB, image optimizer, batch resize with quality search, mozjpeg jpegli encoder."
 ---
 
 # 图片批量压缩到指定体积
@@ -32,17 +32,17 @@ cp SKILL.md ~/.agents/skills/image-compress/
 
 ## 依赖
 
-三个 Python 包，用 uv 可免安装直接运行：
+四个 Python 包，用 uv 可免安装直接运行：
 
 ```bash
-uv run --with zxing-cpp --with pillow --with numpy python scripts/img_shrink.py --help
+uv run --with zxing-cpp --with pillow --with numpy --with imagecodecs \
+  python scripts/img_shrink.py --help
 ```
 
-- `pillow`：图片读写与 JPEG 编码
+- `pillow`：图片读写与 libjpeg-turbo 编码
 - `numpy`：画质评估
 - `zxing-cpp`：二维码检测（不用 `--no-qr` 时需要）
-
-可选：`pyjpegli`（Google jpegli 编码器，见下方编码器选择）。
+- `imagecodecs`：提供 mozjpeg 与 jpegli 两个额外编码后端（Windows x64 有 cp312 abi3 wheel，约 19MB，依赖 numpy>=2.1）。不装也能跑，只是 `--codec auto` 退化为只用 pillow。
 
 ## 标准流程
 
@@ -50,11 +50,11 @@ uv run --with zxing-cpp --with pillow --with numpy python scripts/img_shrink.py 
 
 ```bash
 # 1. 预演（不写盘），核对尺寸、质量、SSIM、检出码数
-uv run --with zxing-cpp --with pillow --with numpy \
+uv run --with zxing-cpp --with pillow --with numpy --with imagecodecs \
   python scripts/img_shrink.py --dry-run "目录路径"
 
 # 2. 正式执行（原地覆盖，不留备份）
-uv run --with zxing-cpp --with pillow --with numpy \
+uv run --with zxing-cpp --with pillow --with numpy --with imagecodecs \
   python scripts/img_shrink.py "目录路径1" "目录路径2"
 ```
 
@@ -65,37 +65,49 @@ uv run --with zxing-cpp --with pillow --with numpy \
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--limit-mb` | 1.0 | 体积上限 |
-| `--max-edge` | 3000 | 最大长边，避免无意义超采样 |
-| `--min-edge` | 1500 | 最小长边 |
+| `--max-edge` | 0 | 长边硬上限，0=跟随原图。确有平台限制（如某站限 3000）再传 |
+| `--min-edge` | 1500 | 最小长边，撑不住就报「无可行组合」 |
 | `--qr-min-edge` | 1800 | 含二维码图的最小长边，保扫码可用 |
-| `--codec` | pillow | 编码器，见下方编码器选择 |
+| `--codec` | auto | 编码后端：auto / pillow / mozjpeg / jpegli |
 | `--no-qr` | 关 | 不做二维码检测（图里确定没码时更快） |
 | `--dry-run` | 关 | 只报告不写盘 |
 | `--report` | 空 | 结果写 JSON 的路径 |
 
-## 编码器选择（实测结论）
+## 编码器选择（2026-11-24 实测重写）
 
-默认用 `pillow`（libjpeg-turbo 4:4:4 + 渐进式 + optimize）。
+装了 `imagecodecs` 时 `--codec auto` 会依次试 jpegli / mozjpeg / pillow，按同尺寸下的 SSIM + 色度挑最优；没装则只用 pillow。
 
-**不要因为「jpegli 是更新的编码器」就切过去。** 在 12 张同批语料上按同体积对比，jpegli 画质略差：
+**三者在 33 张同批语料上的实测（2400px、600KB 预算、4:2:0）：**
 
-| 指标 | jpegli vs pillow |
-|---|---|
-| 亮度 SSIM @1300px | jpegli 胜 0/12，中位差 −0.00133 |
-| 色度 PSNR | jpegli 胜 0/12，中位差 −1.29dB |
+| 后端 | 平均 SSIM | 强边保持率 |
+|---|---|---|
+| mozjpeg | 0.95814 | 0.8395 |
+| pillow | 0.95730 | **0.8720** |
+| jpegli | 0.95337 | 0.8577 |
 
-原因是 jpegli 的质量参数刻度与 Pillow 不同，同样数字不对应同样画质。网上「jpegli 同画质省 20% 体积」的说法在手机照片语料上成立，但换成「塞进固定体积」的用法、且内容是大色块少渐变时，结论会反过来。
+结论：**没有单一赢家**。mozjpeg 的 SSIM 略高，pillow 的细节保留最好，jpegli 居中但最快（约 0.1s/次，pillow 约 0.3s，mozjpeg 约 2.1s）。该批语料含大量自相似高频纹理，jpegli 的自适应量化会把它们当噪声抹掉，所以在合成图上的领先优势消失了——这也是 auto 模式存在的理由，不要预设哪个更好。
 
-`--codec jpegli` 保留作备选：它的质量档范围更宽（q70–96），当 Pillow 在某些图上压不进目标体积时可以试。装了 pyjpegli 才生效，没装自动回落。
+两个容易踩的坑：
+
+- `imagecodecs` 的 `subsampling` 要传字符串 `'444'/'422'/'420'`，传整数会报 `TypeError: 'int' object is not iterable`。
+- jpegli 默认输出 baseline，必须显式传 `progressive=True`，实测再省约 7% 体积。
 
 **横向对比编码器时必须固定同一个轴**（同体积比画质，或同画质比体积），不能直接比 quality 数字。
+
+## 尺寸策略（实测重写）
+
+策略是**先保尺寸，再优化质量**：从原尺寸起用预算能撑住的最高质量，只有质量跌破 75 才按 0.85 步长缩一档，最多缩到 `--min-edge`。
+
+不要改成「扫描尺寸空间按画质选优」。试过，失败：任何把候选放大回原尺寸再比清晰度的指标，都会让最大尺寸几乎必胜（实测同一张图 3600px 强边保持率 0.918、1700px 只有 0.629），尺寸选择就失去意义。而且真实图上会选出「3600px + q13」这种块效应明显的结果。
+
+同理，`--max-edge` 默认改成 0（跟随原图）。旧默认硬砍到 3000 会浪费预算：实测 3600px 的图缩到 3000 只用掉 59% 预算，放宽回原尺寸后画质更高且体积仍在上限内。
 
 ## 内置保护（不要绕过）
 
 1. **长边断言**：缩放一律按 `max(宽,高)` 计算，落盘前后双重校验。横竖图混批不会缩错。
-2. **二维码硬约束**：检测到二维码的图，压缩后必须仍能解出原码，否则降质量重试。检测走「整图粗检 → 按位置裁切放大精检 → 区域盲扫兜底」三段式，只认 QRCode 格式，避免页面上的数字文字被误判成条码。
+2. **二维码硬约束**：检测到二维码的图，压缩后必须仍能解出原码，否则降质量重试，降到头仍解不出就换更小尺寸重试。检测走「整图粗检 → 按位置裁切放大精检 → 区域盲扫兜底」三段式，只认 QRCode 格式，避免页面上的数字文字被误判成条码。
 3. **原地写入带回滚**：用 `r+b` 覆盖后截断，失败会把原内容写回，不产生半截文件。
-4. **Orientation 修正**：转正后把非法值（0 等）字节级改为 1，不重编码像素。
+4. **Orientation 一律清除**：像素经 `exif_transpose` 转正后，EXIF 里的 Orientation 标签必须删掉。留着会让查看器再转一次；值为 0 这类非法值更会被各种软件解释成随机角度（实测踩到过，源图 orientation=0 一路带到了输出）。
 
 ## 交付前必须核验
 
@@ -122,9 +134,11 @@ for f in sorted(glob.glob('目录/*.jpg')):
 
 ## 已知取舍
 
-- **视觉无损 ≠ 数学无损**：2600 万像素手机照片全分辨率压不进 1MB，必须降分辨率。工具会实测选 SSIM 最优组合。
+- **视觉无损 ≠ 数学无损**：2600 万像素手机照片全分辨率压不进 1MB，必须降分辨率。工具按「先保尺寸再降质量」处理，质量跌破 75 才缩一档。
 - **质量档因内容而异**：密集文字页、满版编号的小图在同样体积下只能取更低质量档，这是内容熵决定的，正常现象。
 - **面积小的关键元素**（二维码、小字标签）要靠裁切核验，整图 SSIM 会掩盖局部劣化。
+- **子采样按内容自适应**：先试 4:4:4 作基准，再试 4:2:0，若色度 PSNR 相对降幅超过 3dB 就弃用 4:2:0。实测纹理图/文字图 4:2:0 只掉 0.8–2.0dB（可用），彩色文字页掉 6.8–15.5dB（必须 4:4:4）。这条判据用相对值而非绝对值，因为高饱和内容本身色度信息多，4:4:4 也达不到高 dB。
+- **质量下限 40 的惩罚**：低于 q40 的候选会被按比例折损评分。不加这条会在真实图上选出 q13 这类块效应明显的结果。
 
 ## 不留备份的口径
 
@@ -137,3 +151,7 @@ for f in sorted(glob.glob('目录/*.jpg')):
 **二维码报「码=0/0」但图里明明有**：先确认码是否太小。用 `--dry-run` 看检出数，若与肉眼不符，把码区裁切出来单独验证。
 
 **无法覆盖文件（PermissionError）**：多为看图软件或资源管理器持有文件句柄，关闭预览后重试。Windows 下同一进程内未关闭的图片句柄也会锁文件。
+
+**结果里 `codec` 字段始终是 pillow**：检查 imagecodecs 是否装了（`uv run --with imagecodecs python -c "import imagecodecs"`）。未装时 `--codec auto` 会静默退化为只用 pillow。
+
+**单图耗时比预期长**：auto 模式在原尺寸上要跑 3 个后端 × 2 种子采样 × 每次 7 轮二分编码。实测约 5–10 秒/张（mozjpeg 单次编码就要 2.1 秒）。只要压得准就用 `--codec pillow` 或 `--codec jpegli` 锁单后端，能快 2–3 倍。
