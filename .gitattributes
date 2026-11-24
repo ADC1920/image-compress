@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
