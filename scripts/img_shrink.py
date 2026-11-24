@@ -1,6 +1,6 @@
 """批量把图片压到指定体积上限内（原地覆盖，不留备份）。
 
-用途：电商面料图等需要「网页/IM 可用」的图片批量压到 1MB 以内。
+用途：需要「网页/IM 可用」的图片批量压到 1MB 以内。
 跑法：
   先看会做什么（不写盘）：
     python img_shrink.py --dry-run "D:/路径/批次目录"
@@ -68,7 +68,7 @@ REGIONS = (
 def codes_full(img):
     """完整检测：多二值化器 + 精确位置裁切放大 + 区域盲扫兜底。
 
-    只收二维码（QRCode），避免页面上的货号/编号被误识别成 Code128 等条码，
+    只收二维码（QRCode），避免页面上的数字文字被误识别成 Code128 等条码，
     污染基准导致「压后多出一个码」的假告警。
     小尺寸的码（占全图不到 1%）在整图检测下常被 downscale 吃掉，
     故先用 read_barcodes 拿到位置信息，按位置裁切放大后重测。
@@ -127,7 +127,7 @@ def codes_full(img):
 
 
 def codes_quick(img):
-    """选参时的快速过滤：只认二维码，避免把货号文字当成码。"""
+    """选参时的快速过滤：只认二维码，避免把数字文字当成码。"""
     return {r.text for r in zxingcpp.read_barcodes(
         img, try_rotate=True, try_downscale=True)
         if r.format == zxingcpp.BarcodeFormat.QRCode}
@@ -190,10 +190,10 @@ def encode(img, exif_bytes, dpi, quality, codec="pillow"):
     """编码为 JPEG。
 
     codec="pillow"（默认）：libjpeg-turbo 4:4:4 + 渐进式 + optimize。
-        2026-11-24 在 12 张真实面料图上实测，同体积下画质优于 jpegli
+        2026-11-24 在 12 张同批语料上实测，同体积下画质优于 jpegli
         （亮度 SSIM 中位差 +0.00133、色度 PSNR +1.29dB），故作为默认。
 
-    codec="jpegli"：Google jpegli，同体积下在面料图上画质略差，但质量参数范围
+    codec="jpegli"：Google jpegli，同体积下在大色块语料上画质略差，但质量参数范围
         更宽（q70-96 对应更细粒度），当 Pillow 压不进目标体积时可作为备选。
         固定 4:2:0 子采样、baseline（非渐进式），输出 JPEG 兼容。
 
